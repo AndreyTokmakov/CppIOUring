@@ -20,4 +20,5 @@ else()
 endif()
 
 add_subdirectory(experiments)
+add_subdirectory(networking)
 add_subdirectory(utilities)
