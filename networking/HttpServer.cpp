@@ -6,145 +6,182 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cstring>
+#include <memory>
 #include <iostream>
 
 using namespace std::string_view_literals;
 
-constexpr int PORT = 8080;
-constexpr int QUEUE_DEPTH = 1024;
-constexpr int BUFFER_SIZE = 4096;
 
-constexpr std::string_view RESPONSE =
+namespace
+{
+    using Handle = int32_t;
+    using Port   = uint16_t;
+
+    constexpr Handle InvalidHandle { -1 };
+    constexpr Port serverPort { 52525 };
+    constexpr uint32_t QueueDepth { 1024 };
+    constexpr uint32_t BufferSize { 4096 };
+
+    constexpr std::string_view RESPONSE =
     "HTTP/1.1 200 OK\r\n"
     "Content-Length: 13\r\n"
     "Connection: keep-alive\r\n"
     "\r\n"
     "Hello, world!"sv;
 
+    struct Connection
+    {
+        Handle fd { InvalidHandle };
+        std::array<char, BufferSize> buffer{};
+    };
 
-struct Connection
-{
-    int fd;
-    char buffer[BUFFER_SIZE];
-    size_t read_len = 0;
-};
+    enum class OpType: uint8_t
+    {
+        ACCEPT,
+        READ,
+        WRITE
+    };
 
-enum class OpType
-{
-    ACCEPT,
-    READ,
-    WRITE
-};
+    struct Request
+    {
+        OpType type;
+        Connection* conn;
+    };
 
-struct Request
-{
-    OpType type;
-    Connection* conn;
-};
+    struct SocketGuard final
+    {
+        Handle sock { InvalidHandle };
 
-static int set_nonblocking(const int fd)
-{
-    const int flags = fcntl(fd, F_GETFL, 0);
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
+        explicit SocketGuard(const Handle s): sock {s} { }
 
-void add_accept(io_uring& ring, const int server_fd)
-{
-    auto* req = new Request{OpType::ACCEPT, nullptr};
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-    io_uring_prep_accept(sqe, server_fd, nullptr, nullptr, 0);
-    sqe->user_data = reinterpret_cast<uint64_t>(req);
-}
+        ~SocketGuard()
+        {
+            if (sock != InvalidHandle) {
+                ::close(sock);
+            }
+        }
 
-void add_read(io_uring& ring, Connection* conn)
-{
-    auto* req = new Request{OpType::READ, conn};
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-    io_uring_prep_recv(sqe, conn->fd, conn->buffer, BUFFER_SIZE, 0);
-    sqe->user_data = reinterpret_cast<uint64_t>(req);
-}
+        SocketGuard(const SocketGuard&) = delete;
+        SocketGuard(SocketGuard&&) noexcept = delete;
 
-void add_write(io_uring& ring, Connection* conn, const char* data, const size_t len)
-{
-    auto* req = new Request{OpType::WRITE, conn};
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-    io_uring_prep_send(sqe, conn->fd, data, len, 0);
-    sqe->user_data = reinterpret_cast<uint64_t>(req);
+        SocketGuard& operator=(const SocketGuard&) = delete;
+        SocketGuard& operator=(SocketGuard&&) noexcept = delete;
+    };
+
+    Handle seNonBlocking(const Handle sock)
+    {
+        const Handle flags = ::fcntl(sock, F_GETFL, 0);
+        if (flags == InvalidHandle) {
+            throw std::runtime_error("fcntl(F_GETFL) failed");
+        }
+        if (const Handle handle = ::fcntl(sock, F_SETFL, flags | O_NONBLOCK); handle == InvalidHandle) {
+            throw std::runtime_error ( "::fcntl() failed" );
+        } else {
+            return handle;
+        }
+    }
+
+    void addAccept(io_uring& ring, const Handle server_fd)
+    {
+        Request* req = new Request{OpType::ACCEPT, nullptr};
+        io_uring_sqe* sqe = ::io_uring_get_sqe(&ring);
+        ::io_uring_prep_accept(sqe, server_fd, nullptr, nullptr, 0);
+        sqe->user_data = reinterpret_cast<uint64_t>(req);
+    }
+
+    void addRead(io_uring& ring, Connection* conn)
+    {
+        Request* req = new Request{OpType::READ, conn};
+        io_uring_sqe* sqe = ::io_uring_get_sqe(&ring);
+        ::io_uring_prep_recv(sqe, conn->fd, std::data(conn->buffer), std::size(conn->buffer), 0);
+        sqe->user_data = reinterpret_cast<uint64_t>(req);
+    }
+
+    void addWrite(io_uring& ring, Connection* conn, const char* data, const size_t len)
+    {
+        Request* req = new Request{OpType::WRITE, conn};
+        io_uring_sqe* sqe = ::io_uring_get_sqe(&ring);
+        ::io_uring_prep_send(sqe, conn->fd, data, len, 0);
+        sqe->user_data = reinterpret_cast<uint64_t>(req);
+    }
 }
 
 [[noreturn]]
 void runServer()
 {
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    const Handle serverFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverFd < 0) {
+        throw std::runtime_error("socket failed");
+    }
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(PORT);
+    SocketGuard socketGuard(serverFd);
+    const sockaddr_in server { AF_INET, htons(serverPort), {.s_addr = INADDR_ANY}, {}};
 
-    bind(server_fd, (sockaddr*)&addr, sizeof(addr));
-    listen(server_fd, SOMAXCONN);
-    set_nonblocking(server_fd);
+    if (::bind(serverFd, reinterpret_cast<const sockaddr*>(&server),sizeof(server)) < 0) {
+        throw std::runtime_error("bind failed");
+    }
 
-    io_uring ring;
-    io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
+    listen(serverFd, SOMAXCONN);
+    seNonBlocking(serverFd);
 
-    add_accept(ring, server_fd);
-    io_uring_submit(&ring);
+    io_uring ring{};
+    :: io_uring_queue_init(QueueDepth, &ring, 0);
+
+    addAccept(ring, serverFd);
+    :: io_uring_submit(&ring);
 
     while (true)
     {
         io_uring_cqe* cqe;
-        io_uring_wait_cqe(&ring, &cqe);
-        const Request* req = reinterpret_cast<Request *>(cqe->user_data);
+        ::io_uring_wait_cqe(&ring, &cqe);
+        std::unique_ptr<Request> request {reinterpret_cast<Request*>(cqe->user_data) };
         if (cqe->res < 0) {
             std::cerr << "Error: " << strerror(-cqe->res) << "\n";
-            delete req;
             io_uring_cqe_seen(&ring, cqe);
             continue;
         }
 
-        switch (req->type)
+        switch (request->type)
         {
             case OpType::ACCEPT:
             {
                 const int client_fd = cqe->res;
-                set_nonblocking(client_fd);
+                seNonBlocking(client_fd);
                 auto* conn = new Connection{client_fd};
-                add_read(ring, conn);
-                add_accept(ring, server_fd);
+                addRead(ring, conn);
+                addAccept(ring, serverFd);
                 break;
             }
             case OpType::READ:
             {
-                Connection* conn = req->conn;
+                Connection* conn = request->conn;
                 if (cqe->res == 0) {
                     close(conn->fd);
                     delete conn;
                     break;
                 }
-                add_write(ring, conn, RESPONSE.data(), RESPONSE.size());
+                addWrite(ring, conn, RESPONSE.data(), RESPONSE.size());
                 break;
             }
             case OpType::WRITE:
             {
-                Connection* conn = req->conn;
+                Connection* conn = request->conn;
                 // keep-alive: read next request
-                add_read(ring, conn);
+                addRead(ring, conn);
                 break;
             }
         }
 
-        delete req;
         io_uring_cqe_seen(&ring, cqe);
         io_uring_submit(&ring);
     }
 
-    io_uring_queue_exit(&ring);
-    close(server_fd);
+    ::io_uring_queue_exit(&ring);
 }
 
 void Networking::HttpServer::TestAll()
 {
     runServer();
+
+    // http://127.0.0.1:52525/
 }

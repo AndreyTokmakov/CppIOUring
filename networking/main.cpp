@@ -11,11 +11,14 @@ Description :
 #include <string_view>
 #include <vector>
 
+#include "Networking.hpp"
+
 int main([[maybe_unused]] int argc,
          [[maybe_unused]] char** argv)
 {
     const std::vector<std::string_view> args(argv + 1, argv + argc);
 
+    Networking::HttpServer::TestAll();
 
     return EXIT_SUCCESS;
 }
