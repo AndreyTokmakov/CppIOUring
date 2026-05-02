@@ -28,8 +28,6 @@ namespace
     constexpr Port serverPort { 52525 };
     constexpr uint32_t QueueDepth { 1024 };
     constexpr uint32_t BufferSize { 1024 * 4 };
-    constexpr uint32_t MaxConnections { 10'000 };
-    constexpr uint32_t MaxRequests { 20'000 };
 
     constexpr std::string_view RESPONSE =
     "HTTP/1.1 200 OK\r\n"
@@ -79,39 +77,70 @@ namespace
         SocketGuard& operator=(SocketGuard&&) noexcept = delete;
     };
 
-
-    template<typename T, size_t N>
-    struct ObjectPool
+    template <typename Ty, typename Allocator = std::allocator<Ty>>
+    struct ObjectPoolGrowing
     {
-        std::array<T, N> storage{};
-        std::vector<T*> free_list;
+        using object_type = Ty;
+        using pointer     = object_type*;
+        using size_type   = std::vector<pointer>::size_type;
 
-        ObjectPool()
-        {
-            free_list.reserve(N);
-            for (size_t i = 0; i < N; ++i) {
-                free_list.push_back(&storage[i]);
-            }
+        static_assert(!std::is_same_v<object_type, void>,
+                      "Type of the Objects in the pool can not be void");
+
+        static constexpr size_type DefaultChunkSize { 64 };
+
+        std::vector<pointer> pool;
+        std::vector<pointer> available;
+
+        Allocator allocator {};
+
+        ObjectPoolGrowing() {
+            addChunk(DefaultChunkSize);
         }
 
-        T* alloc()
+        pointer alloc()
         {
-            if (free_list.empty()) {
-                return nullptr;
+            if (available.empty()) {
+                addChunk(DefaultChunkSize);
             }
-            T* obj = free_list.back();
-            free_list.pop_back();
+            const pointer obj = available.back();
+            available.pop_back();
+            LOG << "[alloc] Size " << available.size() + 1 << " ==> " << available.size() << std::endl;
             return obj;
         }
 
-        void free(T* obj) {
-            free_list.push_back(obj);
+        void free(pointer obj)
+        {
+            available.push_back(obj);
+            LOG << "[free] Size " << available.size() - 1 << " ==> " << available.size() << std::endl;
+        }
+
+        ~ObjectPoolGrowing()
+        {
+            // Deallocate all allocated memory.
+            for (pointer chunk : pool) {
+                allocator.deallocate(chunk, DefaultChunkSize);
+            }
+        }
+
+    private:
+
+        void addChunk(const size_type chunkSize)
+        {
+            // Allocate a new chunk of uninitialized memory
+            pointer newBlock { allocator.allocate(chunkSize) };
+
+            // Keep all allocated blocks in 'pool' to delete them later:
+            pool.push_back(newBlock);
+
+            const size_t oldSize = available.size();
+            available.resize(oldSize + chunkSize);
+            std::iota(std::begin(available) + oldSize, std::end(available), newBlock);
         }
     };
 
-
-    ObjectPool<Connection, MaxConnections> connPool;
-    ObjectPool<Request, MaxRequests> reqPool;
+    ObjectPoolGrowing<Connection> connPool;
+    ObjectPoolGrowing<Request> reqPool;
 
     Handle seNonBlocking(const Handle sock)
     {
@@ -129,7 +158,6 @@ namespace
     void addAccept(io_uring& ring, const Handle server_fd)
     {
         Request* req = reqPool.alloc();
-        LOG << "addAccept: res = " << req << std::endl;
         {
             req->type = OpType::Accept;
             req->conn = nullptr;
@@ -142,8 +170,6 @@ namespace
     void addRead(io_uring& ring, Connection* conn)
     {
         Request* req = reqPool.alloc();
-        LOG << "addRead: res = " << req << std::endl;
-
         {
             req->type = OpType::Read;
             req->conn = conn;
@@ -156,8 +182,6 @@ namespace
     void addWrite(io_uring& ring, Connection* conn, const char* data, const size_t len)
     {
         Request* req = reqPool.alloc();
-        LOG << "addWrite: res = " << req << std::endl;
-
         {
             req->type = OpType::Write;
             req->conn = conn;
@@ -168,7 +192,7 @@ namespace
     }
 }
 
-namespace Networking::DebugHttpServer
+namespace Networking::DebugHttpServer_GrowingPool
 {
     [[noreturn]]
     void runServer()
@@ -253,7 +277,7 @@ namespace Networking::DebugHttpServer
     }
 }
 
-void Networking::DebugHttpServer::TestAll()
+void Networking::DebugHttpServer_GrowingPool::TestAll()
 {
     runServer();
     // http://127.0.0.1:52525/

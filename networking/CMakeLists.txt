@@ -14,6 +14,7 @@ add_executable(${PROJECT_NAME}
     main.cpp
     HttpServer.cpp
     DebugHttpServer.cpp
+    DebugHttpServer_GrowingPool.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PUBLIC "${CMAKE_SOURCE_DIR}/utilities")

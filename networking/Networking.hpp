@@ -14,6 +14,7 @@ namespace Networking
 {
     namespace HttpServer { void TestAll(); }
     namespace DebugHttpServer { void TestAll(); }
+    namespace DebugHttpServer_GrowingPool { void TestAll(); }
 }
 
 #endif //CPPIOURING_NETWORKING_HPP
