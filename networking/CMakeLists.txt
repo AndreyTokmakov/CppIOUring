@@ -13,10 +13,14 @@ link_directories(${THIRD_PARTY_DIR}/liburing/install_dir/lib)
 add_executable(${PROJECT_NAME}
     main.cpp
     HttpServer.cpp
+    DebugHttpServer.cpp
 )
+
+target_include_directories(${PROJECT_NAME} PUBLIC "${CMAKE_SOURCE_DIR}/utilities")
+target_link_directories(${PROJECT_NAME} PUBLIC "${CMAKE_BINARY_DIR}/utilities")
 
 TARGET_LINK_LIBRARIES(${PROJECT_NAME}
     utils
-    pthread
     uring
+    pthread
 )

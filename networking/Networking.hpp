@@ -13,6 +13,7 @@ Description : Networking
 namespace Networking
 {
     namespace HttpServer { void TestAll(); }
+    namespace DebugHttpServer { void TestAll(); }
 }
 
 #endif //CPPIOURING_NETWORKING_HPP

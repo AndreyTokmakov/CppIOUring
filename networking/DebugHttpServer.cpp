@@ -1,4 +1,10 @@
 #include "Networking.hpp"
+#include "DateTimeUtilities.hpp"
+
+#include <iostream>
+#include <print>
+#include <syncstream>
+#include <memory>
 
 #include <liburing.h>
 #include <netinet/in.h>
@@ -6,11 +12,11 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cstring>
-#include <memory>
-#include <iostream>
 
 using namespace std::string_view_literals;
 
+#define LOG std::osyncstream { std::cout } << DateTimeUtilities::getCurrentTime() << ' '
+#define ERR std::osyncstream { std::cerr } << DateTimeUtilities::getCurrentTime() << ' '
 
 namespace
 {
@@ -20,7 +26,9 @@ namespace
     constexpr Handle InvalidHandle { -1 };
     constexpr Port serverPort { 52525 };
     constexpr uint32_t QueueDepth { 1024 };
-    constexpr uint32_t BufferSize { 4096 };
+    constexpr uint32_t BufferSize { 1024 * 4 };
+    constexpr uint32_t MaxConnections { 10'000 };
+    constexpr uint32_t MaxRequests { 20'000 };
 
     constexpr std::string_view RESPONSE =
     "HTTP/1.1 200 OK\r\n"
@@ -33,19 +41,21 @@ namespace
     {
         Handle fd { InvalidHandle };
         std::array<char, BufferSize> buffer{};
+        // uint32_t readLen { 0U };
+        // uint32_t writeOffset { 0U };
     };
 
     enum class OpType: uint8_t
     {
-        ACCEPT,
-        READ,
-        WRITE
+        Accept,
+        Read,
+        Write
     };
 
     struct Request
     {
         OpType type;
-        Connection* conn;
+        Connection* conn { nullptr };
     };
 
     struct SocketGuard final
@@ -68,6 +78,41 @@ namespace
         SocketGuard& operator=(SocketGuard&&) noexcept = delete;
     };
 
+
+    template<typename T, size_t N>
+    struct ObjectPool
+    {
+        std::array<T, N> storage{};
+        std::vector<T*> free_list;
+
+        ObjectPool()
+        {
+            free_list.reserve(N);
+            for (size_t i = 0; i < N; ++i) {
+                free_list.push_back(&storage[i]);
+            }
+        }
+
+        T* alloc()
+        {
+            if (free_list.empty()) {
+                return nullptr;
+            }
+            T* obj = free_list.back();
+            free_list.pop_back();
+            // LOG << "[alloc] Size " << free_list.size() + 1 << " ==> " << free_list.size() << std::endl;
+            return obj;
+        }
+
+        void free(T* obj) {
+            free_list.push_back(obj);
+            // LOG << "[free] Size " << free_list.size() - 1 << " ==> " << free_list.size() << std::endl;
+        }
+    };
+
+    ObjectPool<Connection, MaxConnections> connPool;
+    ObjectPool<Request, MaxRequests> reqPool;
+
     Handle seNonBlocking(const Handle sock)
     {
         const Handle flags = ::fcntl(sock, F_GETFL, 0);
@@ -83,7 +128,11 @@ namespace
 
     void addAccept(io_uring& ring, const Handle server_fd)
     {
-        Request* req = new Request{OpType::ACCEPT, nullptr};
+        Request* req = reqPool.alloc();
+        {
+            req->type = OpType::Accept;
+            req->conn = nullptr;
+        }
         io_uring_sqe* sqe = ::io_uring_get_sqe(&ring);
         ::io_uring_prep_accept(sqe, server_fd, nullptr, nullptr, 0);
         sqe->user_data = reinterpret_cast<uint64_t>(req);
@@ -91,7 +140,11 @@ namespace
 
     void addRead(io_uring& ring, Connection* conn)
     {
-        Request* req = new Request{OpType::READ, conn};
+        Request* req = reqPool.alloc();
+        {
+            req->type = OpType::Read;
+            req->conn = conn;
+        }
         io_uring_sqe* sqe = ::io_uring_get_sqe(&ring);
         ::io_uring_prep_recv(sqe, conn->fd, std::data(conn->buffer), std::size(conn->buffer), 0);
         sqe->user_data = reinterpret_cast<uint64_t>(req);
@@ -99,15 +152,18 @@ namespace
 
     void addWrite(io_uring& ring, Connection* conn, const char* data, const size_t len)
     {
-        Request* req = new Request{OpType::WRITE, conn};
+        Request* req = reqPool.alloc();
+        {
+            req->type = OpType::Write;
+            req->conn = conn;
+        }
         io_uring_sqe* sqe = ::io_uring_get_sqe(&ring);
         ::io_uring_prep_send(sqe, conn->fd, data, len, 0);
         sqe->user_data = reinterpret_cast<uint64_t>(req);
     }
 }
 
-
-namespace Networking::HttpServer
+namespace Networking::DebugHttpServer
 {
     [[noreturn]]
     void runServer()
@@ -137,36 +193,44 @@ namespace Networking::HttpServer
         {
             io_uring_cqe* cqe { nullptr };
             ::io_uring_wait_cqe(&ring, &cqe);
-            const std::unique_ptr<Request> request {reinterpret_cast<Request*>(cqe->user_data) };
+            Request* request = reinterpret_cast<Request*>(cqe->user_data);
             if (cqe->res < 0) {
-                std::cerr << "Error: " << strerror(-cqe->res) << "\n";
-                io_uring_cqe_seen(&ring, cqe);
+                ERR << "Error: " << strerror(-cqe->res) << "\n";
+                reqPool.free(request);
+                ::io_uring_cqe_seen(&ring, cqe);
                 continue;
             }
 
             switch (request->type)
             {
-                case OpType::ACCEPT:
+                case OpType::Accept:
                 {
                     const int client_fd = cqe->res;
                     seNonBlocking(client_fd);
-                    Connection* conn = new Connection{client_fd};
-                    addRead(ring, conn);
+                    Connection* conn = connPool.alloc();
+                    {
+                        conn->fd = client_fd;
+                        //conn->readLen = 0;
+                        //conn->writeOffset = 0;
+                    }
                     addAccept(ring, serverFd);
+                    addRead(ring, conn);
                     break;
                 }
-                case OpType::READ:
+                case OpType::Read:
                 {
                     Connection* conn = request->conn;
-                    if (cqe->res == 0) {
+                    if (cqe->res == 0)
+                    {
                         ::close(conn->fd);
-                        delete conn;
+                        LOG << std::format("Closing connection {}\n", conn->fd) ;
+                        connPool.free(conn);
                         break;
                     }
                     addWrite(ring, conn, RESPONSE.data(), RESPONSE.size());
                     break;
                 }
-                case OpType::WRITE:
+                case OpType::Write:
                 {
                     Connection* conn = request->conn;
                     // keep-alive: read next request
@@ -175,16 +239,17 @@ namespace Networking::HttpServer
                 }
             }
 
-            io_uring_cqe_seen(&ring, cqe);
-            io_uring_submit(&ring);
+            reqPool.free(request);
+            ::io_uring_cqe_seen(&ring, cqe);
+            ::io_uring_submit(&ring);
         }
+
         ::io_uring_queue_exit(&ring);
     }
 }
 
-void Networking::HttpServer::TestAll()
+void Networking::DebugHttpServer::TestAll()
 {
     runServer();
-
     // http://127.0.0.1:52525/
 }
